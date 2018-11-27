@@ -1,0 +1,6 @@
+[package]
+name = "nanovg-port-rs"
+version = "0.1.0"
+authors = ["Skyler Lipthay <sl@skylerlipthay.com>"]
+
+[dependencies]
