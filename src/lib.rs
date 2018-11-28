@@ -1,5 +1,24 @@
 #![allow(non_snake_case)]
 
+#[cfg(target_arch = "wasm32")]
+extern crate web_sys;
+#[cfg(target_arch = "wasm32")]
+#[macro_use] extern crate static_assertions;
+
+macro_rules! reserve {
+    ($vec:expr, $len:expr) => {
+        {
+            let free = $vec.capacity() - $vec.len();
+            if $len as usize > free {
+                $vec.reserve($len as usize - free);
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub mod webgl;
+
 // TODO:
 //
 // Skipping text and image operations and types for now. Public:
@@ -72,6 +91,7 @@
 // * `nvgDebugDumpPathCache` (this is for debugging)
 // * `nvgInternalParams` (probably not needed by renderer implementation)
 // * `nvgDeleteInternal` (handled by `Drop`)
+// * `NVGparams.create` (handled by renderer implementation)
 // * `NVGparams.delete` (handled by `Drop`)
 
 use std::ops::{Index, IndexMut};
@@ -80,7 +100,7 @@ use std::ops::{Index, IndexMut};
 
 pub const NVG_PI: f64 = 3.14159265358979323846264338327;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct NVGcolor {
     pub r: f32,
@@ -205,10 +225,10 @@ pub struct NVGpath {
     pub count: i32,
     pub closed: u8,
     pub nbevel: i32,
-    pub fill_first: usize,
-    pub fill_count: i32,
-    pub stroke_first: usize,
-    pub stroke_count: i32,
+    pub fillFirst: usize,
+    pub fillCount: i32,
+    pub strokeFirst: usize,
+    pub strokeCount: i32,
     pub winding: NVGwinding,
     pub convex: i32,
 }
@@ -220,14 +240,15 @@ pub struct NVGparams {
 }
 
 pub trait NVGrender {
-    fn create(&mut self) -> Result<(), ()>;
     fn viewport(&mut self, width: f32, height: f32, devicePixelRatio: f32);
     fn cancel(&mut self);
     fn flush(&mut self);
     fn fill(&mut self, paint: &NVGpaint, compositeOperation: NVGcompositeOperationState,
-            scissor: &NVGscissor, fringe: f32, bounds: [f32; 4], paths: &[NVGpath]);
+            scissor: &NVGscissor, fringe: f32, bounds: [f32; 4], paths: &[NVGpath],
+            verts: &[NVGvertex]);
     fn stroke(&mut self, paint: &NVGpaint, compositeOperation: NVGcompositeOperationState,
-              scissor: &NVGscissor, fringe: f32, strokeWidth: f32, paths: &[NVGpath]);
+              scissor: &NVGscissor, fringe: f32, strokeWidth: f32, paths: &[NVGpath],
+              verts: &[NVGvertex]);
 }
 
 // END: `nanovg.h`
@@ -439,7 +460,7 @@ impl NVGpathCache {
     }
 }
 
-pub fn nvgCreateInternal(params: NVGparams) -> Result<NVGcontext, ()> {
+pub fn nvgCreateInternal(params: NVGparams) -> NVGcontext {
     let mut ctx = NVGcontext {
         params,
         commands: Vec::new(),
@@ -454,8 +475,7 @@ pub fn nvgCreateInternal(params: NVGparams) -> Result<NVGcontext, ()> {
     };
 
     ctx.setDevicePixelRatio(1.0);
-    ctx.params.render.create()?;
-    Ok(ctx)
+    ctx
 }
 
 pub fn nvgBeginFrame(
@@ -906,7 +926,9 @@ fn nvg__distPtSeg(x: f32, y: f32, px: f32, py: f32, qx: f32, qy: f32) -> f32 {
 
 fn nvg__appendCommands(ctx: &mut NVGcontext, commands: Vec<NVGcommand>) {
     let xform = ctx.getState().xform;
-    ctx.commands.reserve(commands.len());
+
+    reserve!(ctx.commands, commands.len());
+
     for command in commands.into_iter() {
         ctx.commands.push(match command {
             NVGcommand::MoveTo { x, y } => {
@@ -941,10 +963,10 @@ fn nvg__addPath(cache: &mut NVGpathCache) {
         count: 0,
         closed: 0,
         nbevel: 0,
-        fill_first: 0,
-        fill_count: 0,
-        stroke_first: 0,
-        stroke_count: 0,
+        fillFirst: 0,
+        fillCount: 0,
+        strokeFirst: 0,
+        strokeCount: 0,
         convex: 0,
         winding: NVG_CCW,
     });
@@ -967,6 +989,8 @@ fn nvg__addPoint(cache: &mut NVGpathCache, distTol: f32, x: f32, y: f32, flags: 
             None => unreachable!(),
         }
     }
+
+    path.count += 1;
 
     cache.points.push(NVGpoint {
         x,
@@ -1422,10 +1446,8 @@ fn nvg__expandStroke(ctx: &mut NVGcontext, w: f32, fringe: f32, lineCap: NVGline
             }
         }
     }
-    let len = ctx.cache.verts.len();
-    if cverts as usize > len {
-        ctx.cache.verts.reserve(len - cverts as usize);
-    }
+
+    reserve!(ctx.cache.verts, cverts);
 
     for path in ctx.cache.paths.iter_mut() {
         let pstart = path.first as usize;
@@ -1437,7 +1459,7 @@ fn nvg__expandStroke(ctx: &mut NVGcontext, w: f32, fringe: f32, lineCap: NVGline
         let e;
 
         let isLoop = path.closed != 0;
-        path.stroke_first = ctx.cache.verts.len();
+        path.strokeFirst = ctx.cache.verts.len();
 
         if isLoop {
             i0 = (path.count - 1) as usize;
@@ -1482,9 +1504,9 @@ fn nvg__expandStroke(ctx: &mut NVGcontext, w: f32, fringe: f32, lineCap: NVGline
         }
 
         if isLoop {
-            let v0 = ctx.cache.verts[path.stroke_first];
+            let v0 = ctx.cache.verts[path.strokeFirst];
             nvg__vmake(&mut ctx.cache.verts, v0.x, v0.y, u0, 1.0);
-            let v1 = ctx.cache.verts[path.stroke_first + 1];
+            let v1 = ctx.cache.verts[path.strokeFirst + 1];
             nvg__vmake(&mut ctx.cache.verts, v1.x, v1.y, u0, 1.0);
         } else {
             let dx = p[i1].x - p[i0].x;
@@ -1499,7 +1521,7 @@ fn nvg__expandStroke(ctx: &mut NVGcontext, w: f32, fringe: f32, lineCap: NVGline
             }
         }
 
-        path.stroke_count = (ctx.cache.verts.len() - path.stroke_first) as i32;
+        path.strokeCount = (ctx.cache.verts.len() - path.strokeFirst) as i32;
     }
 }
 
@@ -1516,10 +1538,7 @@ fn nvg__expandFill(ctx: &mut NVGcontext, w: f32, lineJoin: NVGlineCap, miterLimi
             cverts += (path.count + path.nbevel * 5 + 1) * 2;
         }
     }
-    let len = ctx.cache.verts.len();
-    if cverts as usize > len {
-        ctx.cache.verts.reserve(len - cverts as usize);
-    }
+    reserve!(ctx.cache.verts, cverts);
 
     let convex = ctx.cache.paths.len() == 1 && ctx.cache.paths[0].convex != 0;
 
@@ -1529,7 +1548,7 @@ fn nvg__expandFill(ctx: &mut NVGcontext, w: f32, lineJoin: NVGlineCap, miterLimi
         let p = &mut ctx.cache.points[pstart..pend];
 
         let woff = 0.5 * aa;
-        path.fill_first = ctx.cache.verts.len();
+        path.fillFirst = ctx.cache.verts.len();
 
         if fringe {
             let mut i0 = (path.count - 1) as usize;
@@ -1565,14 +1584,14 @@ fn nvg__expandFill(ctx: &mut NVGcontext, w: f32, lineJoin: NVGlineCap, miterLimi
             }
         }
 
-        path.fill_count = (ctx.cache.verts.len() - path.fill_first) as i32;
+        path.fillCount = (ctx.cache.verts.len() - path.fillFirst) as i32;
 
         if fringe {
             let mut lw = w + woff;
             let rw = w - woff;
             let mut lu = 0.0;
             let ru = 1.0;
-            path.stroke_first = ctx.cache.verts.len();
+            path.strokeFirst = ctx.cache.verts.len();
 
             if convex {
                 lw = woff;
@@ -1595,15 +1614,15 @@ fn nvg__expandFill(ctx: &mut NVGcontext, w: f32, lineJoin: NVGlineCap, miterLimi
                 i1 += 1;
             }
 
-            let v0 = ctx.cache.verts[path.stroke_first];
+            let v0 = ctx.cache.verts[path.strokeFirst];
             nvg__vmake(&mut ctx.cache.verts, v0.x, v0.y, lu, 1.0);
-            let v1 = ctx.cache.verts[path.stroke_first + 1];
+            let v1 = ctx.cache.verts[path.strokeFirst + 1];
             nvg__vmake(&mut ctx.cache.verts, v1.x, v1.y, ru, 1.0);
 
-            path.stroke_count = (ctx.cache.verts.len() - path.stroke_first) as i32;
+            path.strokeCount = (ctx.cache.verts.len() - path.strokeFirst) as i32;
         } else {
-            path.stroke_first = 0;
-            path.stroke_count = 0;
+            path.strokeFirst = 0;
+            path.strokeCount = 0;
         }
     }
 }
@@ -1612,6 +1631,10 @@ pub fn nvgBeginPath(ctx: &mut NVGcontext) {
     ctx.commands.clear();
     ctx.cache.points.clear();
     ctx.cache.paths.clear();
+
+    // So, this isn't how NanoVG manages its verts. All of its verts are "temporary" for just the
+    // render call. See `nvg__allocTempVerts`.
+    ctx.cache.verts.clear();
 }
 
 pub fn nvgMoveTo(ctx: &mut NVGcontext, x: f32, y: f32) {
@@ -1903,7 +1926,7 @@ pub fn nvgFill(ctx: &mut NVGcontext) {
     };
 
     ctx.params.render.fill(&fillPaint, compositeOperation, &scissor, ctx.fringeWidth,
-        ctx.cache.bounds, &ctx.cache.paths);
+        ctx.cache.bounds, &ctx.cache.paths, &ctx.cache.verts);
 }
 
 pub fn nvgStroke(ctx: &mut NVGcontext) {
@@ -1943,7 +1966,7 @@ pub fn nvgStroke(ctx: &mut NVGcontext) {
     };
 
     ctx.params.render.stroke(&strokePaint, compositeOperation, &scissor, ctx.fringeWidth,
-        strokeWidth, &ctx.cache.paths);
+        strokeWidth, &ctx.cache.paths, &ctx.cache.verts);
 }
 
 // END: `nanovg.c`

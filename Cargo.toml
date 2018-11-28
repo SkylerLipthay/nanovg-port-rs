@@ -3,4 +3,16 @@ name = "nanovg-port-rs"
 version = "0.1.0"
 authors = ["Skyler Lipthay <sl@skylerlipthay.com>"]
 
-[dependencies]
+[target.wasm32-unknown-unknown.dependencies]
+static_assertions = "0.3"
+
+[target.wasm32-unknown-unknown.dependencies.web-sys]
+version = "0.3"
+features = [
+  "console",
+  "WebGlBuffer",
+  "WebGlProgram",
+  "WebGlRenderingContext",
+  "WebGlShader",
+  "WebGlUniformLocation",
+]
